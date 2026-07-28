@@ -23,8 +23,10 @@
 
 use async_trait::async_trait;
 
+use super::handoff_notes::{inject_note, HandoffNoteConfig};
 use crate::{
-    Classification, Classifier, Driver, Request, Result, Score, State, StateValue, ToolSignals,
+    Classification, Classifier, Driver, Event, Processor, Request, Result, Score, State,
+    StateValue, ToolSignals,
 };
 
 /// Turn depth below which stall signals stay quiet — early no-write turns are
@@ -285,12 +287,31 @@ fn ratio(numerator: u32, denominator: u32) -> f64 {
     }
 }
 
+/// `State.extra` key under which an ambiguous turn records the tier it falls
+/// open to, for a terminal classifier to resolve.
+pub const DEFAULT_TARGET_KEY: &str = "default_target";
+
+/// `State.extra` key under which the tier the session last routed to is kept,
+/// so the next turn can tell a tier change from a steady-state turn.
+pub const LAST_TIER_KEY: &str = "last_tier";
+
 /// Signal-only stage-router classifier: scores each turn onto the strong/weak
 /// tiers from tool-result signals, via the configured picker mode and the
 /// confidence the scorer must reach before it acts on the signal alone.
+///
+/// With [`with_handoff_notes`](Self::with_handoff_notes) it also hands the model
+/// taking over a note explaining the switch, spliced into the outbound request.
+///
+/// It is a [`Processor`] as well as a [`Classifier`]: the processor role records
+/// the tier each turn actually routed to, which the classifier role reads back
+/// to gate notes on real tier *changes*. Register it with
+/// [`FallThrough::with_component`](crate::algorithms::FallThrough::with_component)
+/// so both roles share one instance — the processor role sees the final decision
+/// even on turns this classifier left ambiguous and a later classifier resolved.
 pub struct StageClassifier {
     mode: PickerMode,
     confidence_threshold: f64,
+    handoff_notes: Option<HandoffNoteConfig>,
 }
 
 impl StageClassifier {
@@ -300,7 +321,57 @@ impl StageClassifier {
         Self {
             mode,
             confidence_threshold,
+            handoff_notes: None,
         }
+    }
+
+    /// Hand the model taking over a note when a turn changes tier.
+    pub fn with_handoff_notes(mut self, config: HandoffNoteConfig) -> Self {
+        self.handoff_notes = Some(config);
+        self
+    }
+
+    /// Splices the handoff note for a turn this classifier resolved to `tier`.
+    ///
+    /// Only a tier *change* earns a note, so the first turn of a session and
+    /// every steady-state turn after it inject nothing — which also keeps the
+    /// note out of the prompt-cache prefix on the turns that dominate a session.
+    fn apply_handoff_note(
+        &self,
+        state: &State,
+        request: &mut Request,
+        tier: &str,
+        source: DecisionSource,
+    ) {
+        let Some(config) = &self.handoff_notes else {
+            return;
+        };
+        let changed_tier = matches!(
+            state.extra.get(LAST_TIER_KEY),
+            Some(StateValue::String(last)) if last != tier
+        );
+        if !changed_tier {
+            return;
+        }
+        if let Some(note) = config.note_for(tier, Some(source.as_str())) {
+            inject_note(request, &note);
+        }
+    }
+}
+
+/// Records the tier the turn routed to, for the next turn's change detection.
+#[async_trait]
+impl Processor for StageClassifier {
+    async fn process(&self, state: &mut State, event: Event<'_>) -> Result<()> {
+        // The decision is replayed after the whole cascade has run, so this is
+        // the tier the turn really used — not just what this classifier scored.
+        if let Event::Decision(decision) = event {
+            state.extra.insert(
+                LAST_TIER_KEY.to_string(),
+                StateValue::String(decision.selected_model().to_string()),
+            );
+        }
+        Ok(())
     }
 }
 
@@ -309,7 +380,7 @@ impl Classifier for StageClassifier {
     async fn score(
         &self,
         state: &mut State,
-        _request: &mut Request,
+        request: &mut Request,
         _driver: Option<&Driver>,
     ) -> Result<Classification> {
         let tool_signals = &state.tool_signals;
@@ -321,7 +392,7 @@ impl Classifier for StageClassifier {
                 Tier::Efficient => "weak",
             };
             state.extra.insert(
-                "default_target".to_string(),
+                DEFAULT_TARGET_KEY.to_string(),
                 StateValue::String(target.to_string()),
             );
             state.extra.insert(
@@ -350,6 +421,10 @@ impl Classifier for StageClassifier {
                     "decision_source".to_string(),
                     StateValue::String(source.as_str().to_string()),
                 );
+                // Only a resolved turn routes on this classifier's target, so it
+                // is the only branch whose tier change is this router's to
+                // explain — an ambiguous turn is decided further down the cascade.
+                self.apply_handoff_note(state, request, target, source);
                 let conf = score.abs();
                 // TODO add the non-target to this score set?
                 Ok(Classification::Scores(vec![Score {
@@ -367,7 +442,7 @@ impl Classifier for StageClassifier {
                     Tier::Efficient => "weak",
                 };
                 state.extra.insert(
-                    "default_target".to_string(),
+                    DEFAULT_TARGET_KEY.to_string(),
                     StateValue::String(target.to_string()),
                 );
                 state.extra.insert(
@@ -585,6 +660,156 @@ mod tests {
         assert!(matches!(
             state.extra.get("default_target"),
             Some(StateValue::String(target)) if target == "strong"
+        ));
+        Ok(())
+    }
+
+    // ─── handoff notes ───────────────────────────────────────────────────
+
+    const ESCALATION: &str = "the previous model was stalling";
+
+    /// A classifier that hands the strong tier an escalation note, gated to
+    /// signal-driven escalations.
+    fn noting_classifier(mode: PickerMode) -> StageClassifier {
+        StageClassifier::new(mode, 0.5)
+            .with_handoff_notes(HandoffNoteConfig::new(ESCALATION, None, true))
+    }
+
+    /// A one-user-turn request, the thing a note gets spliced into.
+    fn request() -> Request {
+        Request {
+            llm_request: switchyard_protocol::text_request(Some("auto".to_string()), "hi"),
+            raw_request: None,
+            metadata: None,
+        }
+    }
+
+    /// The trailing user turn's text, note included.
+    fn trailing_text(request: &Request) -> Option<String> {
+        request
+            .llm_request
+            .messages
+            .last()
+            .and_then(|message| message.text_content("|"))
+    }
+
+    /// A state whose last routed tier is `tier`, as the processor role records it.
+    async fn state_on_tier(signal: ToolSignals, tier: &'static str) -> Result<State> {
+        struct FakeDecision(&'static str);
+        impl crate::Decision for FakeDecision {
+            fn selected_model(&self) -> &str {
+                self.0
+            }
+            fn reasoning(&self) -> Option<&str> {
+                None
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let mut state = state_with(signal);
+        StageClassifier::new(PickerMode::EfficientFirst, 0.5)
+            .process(&mut state, Event::Decision(&FakeDecision(tier)))
+            .await?;
+        Ok(state)
+    }
+
+    #[tokio::test]
+    async fn note_injected_when_a_signal_driven_turn_changes_tier() -> Result<()> {
+        // Weak last turn, critical severity this turn → a real escalation.
+        let signal = ToolSignals {
+            severity: SEVERITY_CRITICAL,
+            ..Default::default()
+        };
+        let mut state = state_on_tier(signal, "weak").await?;
+        let mut request = request();
+
+        noting_classifier(PickerMode::EfficientFirst)
+            .score(&mut state, &mut request, None)
+            .await?;
+
+        assert_eq!(trailing_text(&request), Some(format!("hi|{ESCALATION}")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_note_when_the_turn_stays_on_the_same_tier() -> Result<()> {
+        // Same escalation signal, but the session was already on strong — nothing
+        // was handed over, so the note would be a lie (and a cache-prefix cost).
+        let signal = ToolSignals {
+            severity: SEVERITY_CRITICAL,
+            ..Default::default()
+        };
+        let mut state = state_on_tier(signal, "strong").await?;
+        let mut request = request();
+
+        noting_classifier(PickerMode::EfficientFirst)
+            .score(&mut state, &mut request, None)
+            .await?;
+
+        assert_eq!(trailing_text(&request), Some("hi".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_note_on_the_first_turn_of_a_session() -> Result<()> {
+        // No tier recorded yet, so there is no handover to explain.
+        let signal = ToolSignals {
+            severity: SEVERITY_CRITICAL,
+            ..Default::default()
+        };
+        let mut state = state_with(signal);
+        let mut request = request();
+
+        noting_classifier(PickerMode::EfficientFirst)
+            .score(&mut state, &mut request, None)
+            .await?;
+
+        assert!(!state.extra.contains_key(LAST_TIER_KEY));
+        assert_eq!(trailing_text(&request), Some("hi".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_note_on_an_ambiguous_turn() -> Result<()> {
+        // A quiet signal falls open: the cascade, not this classifier, picks the
+        // tier, so it is not this classifier's handover to narrate.
+        let mut state = state_on_tier(ToolSignals::default(), "weak").await?;
+        let mut request = request();
+
+        let classification = noting_classifier(PickerMode::CapableFirst)
+            .score(&mut state, &mut request, None)
+            .await?;
+
+        assert!(matches!(classification, Classification::Ambiguous(_)));
+        assert_eq!(trailing_text(&request), Some("hi".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn no_note_when_notes_are_unconfigured() -> Result<()> {
+        let signal = ToolSignals {
+            severity: SEVERITY_CRITICAL,
+            ..Default::default()
+        };
+        let mut state = state_on_tier(signal, "weak").await?;
+        let mut request = request();
+
+        StageClassifier::new(PickerMode::EfficientFirst, 0.5)
+            .score(&mut state, &mut request, None)
+            .await?;
+
+        assert_eq!(trailing_text(&request), Some("hi".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn processor_role_records_the_tier_the_turn_routed_to() -> Result<()> {
+        let state = state_on_tier(ToolSignals::default(), "strong").await?;
+        assert!(matches!(
+            state.extra.get(LAST_TIER_KEY),
+            Some(StateValue::String(tier)) if tier == "strong"
         ));
         Ok(())
     }

@@ -167,6 +167,15 @@ impl Algorithm<SharedState> for FallThrough {
                 .await?;
         }
 
+        // 5. Offer the outbound request to the processors, now that the target is known.
+        //    This is the only hook that sees both the decision and the request, so it is
+        //    where a decision-dependent rewrite (a per-tier system prompt) belongs.
+        for processor in &self.processors {
+            processor
+                .process(&mut state, Event::ModelRequest(&mut request))
+                .await?;
+        }
+
         driver
             .call_llm_target(ctx.without_state(), &target, request, decision)
             .await
@@ -400,10 +409,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn processor_observes_request_and_decision() -> Result<()> {
+    async fn processor_observes_request_decision_then_model_request() -> Result<()> {
         use parking_lot::Mutex;
 
-        // Records which event kinds it saw, proving the request-then-decision replay.
+        // Records which event kinds it saw, proving the replay order: the inbound
+        // request, then the decision, then the request on its way to the model.
         struct RecordingProcessor(Arc<Mutex<Vec<&'static str>>>);
 
         #[async_trait]
@@ -412,6 +422,7 @@ mod tests {
                 let kind = match event {
                     Event::Request(_) => "request",
                     Event::Decision(_) => "decision",
+                    Event::ModelRequest(_) => "model_request",
                     _ => "other",
                 };
                 self.0.lock().push(kind);
@@ -425,7 +436,7 @@ mod tests {
             .with_classifier(fixed(vec![score("strong", 1.0)]));
         run(router).await?;
 
-        assert_eq!(*seen.lock(), vec!["request", "decision"]);
+        assert_eq!(*seen.lock(), vec!["request", "decision", "model_request"]);
         Ok(())
     }
 

@@ -99,9 +99,11 @@ pub fn initialize_metrics() {
 /// core (scorer, picker, and the `StageClassifier`).
 // TODO cleanup once switchyard-components is removed
 pub mod stage_router {
-    pub use crate::algorithms::util::handoff_notes::{HandoffNoteProcessor, HANDOFF_NOTE_KEY};
+    pub use crate::algorithms::stage::{LlmFallback, StageRouterConfig};
+    pub use crate::algorithms::util::handoff_notes::HandoffNoteConfig;
     pub use crate::algorithms::util::stage_router::{
         dimensions_from_signal, pick_tier, score_signal, CodingAgentDimensions, DecisionSource,
-        PickOutcome, PickerMode, ScoreResult, StageClassifier, Tier,
+        PickOutcome, PickerMode, ScoreResult, StageClassifier, Tier, LAST_TIER_KEY,
     };
+    pub use crate::algorithms::util::tier_prompts::{TierPromptProcessor, TierPrompts};
 }

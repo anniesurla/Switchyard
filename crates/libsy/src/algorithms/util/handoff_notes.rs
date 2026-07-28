@@ -8,30 +8,28 @@
 //! knows *why* — without re-diagnosing (weak→strong) or re-architecting settled
 //! work (strong→weak). This is not a model call; the note text comes from config.
 //!
-//! [`HandoffNoteProcessor`] reacts to [`Event::Decision`] (replayed after the
-//! tier is chosen, before the model call), derives escalate vs de-escalate from
-//! the chosen tier plus the `decision_source` the picker stashed, and records
-//! the matching note on the [`State`] under [`HANDOFF_NOTE_KEY`]. A later
-//! request-injection step splices it into the outbound request — that step is
-//! intentionally not wired here.
+//! [`HandoffNoteConfig`] owns the note text and the gate deciding which note (if
+//! any) a tier change earns; [`inject_note`] splices it into the outbound
+//! request. Both are driven by
+//! [`StageClassifier`](super::stage_router::StageClassifier) — the one component
+//! that knows the chosen tier, why it was chosen, and the tier the session was
+//! on before it.
+//!
+//! The note is **ephemeral**: it rides in the single forwarded request and is
+//! never written back into the caller's history, so notes cannot accumulate
+//! across turns.
 
-use async_trait::async_trait;
+use switchyard_protocol::{ContentBlock, Message, Request, Role};
 
-use crate::{Event, Processor, Result, State, StateValue};
-
-/// `State.extra` key under which the computed handoff note is recorded for a
-/// later request-injection step to consume.
-pub const HANDOFF_NOTE_KEY: &str = "handoff_note";
-
-/// Records a handoff note on the decision, based on the chosen tier and the
-/// picker's `decision_source`. Deterministic — no model call.
-pub struct HandoffNoteProcessor {
+/// The notes a stage router hands to the model taking over, and the gate that
+/// decides when the escalation note applies.
+pub struct HandoffNoteConfig {
     escalation_note: String,
     deescalation_note: Option<String>,
     only_on_wrong_signal_escalation: bool,
 }
 
-impl HandoffNoteProcessor {
+impl HandoffNoteConfig {
     /// Configure the notes: the `escalation_note` handed to the strong tier, an
     /// optional `deescalation_note` handed back to the weak tier, and whether
     /// the escalation note fires only on a signal-driven escalation
@@ -48,12 +46,13 @@ impl HandoffNoteProcessor {
         }
     }
 
-    /// The note to record for a decision routed to `tier` with picker `source`,
-    /// or `None` when no note applies.
-    fn note_for(&self, tier: &str, source: Option<&str>) -> Option<String> {
+    /// The note for a turn routed to `tier` with picker `source`, or `None` when
+    /// no note applies.
+    pub(crate) fn note_for(&self, tier: &str, source: Option<&str>) -> Option<String> {
         match tier {
             // Escalation to the strong tier. When gated, only a signal-driven
-            // escalation qualifies — never a `fall_open` default.
+            // escalation qualifies — never a `fall_open` default, which would
+            // tell the strong model the weak one was stalling when it wasn't.
             "strong" => {
                 let signal_driven = matches!(source, Some("override") | Some("dimensions"));
                 (!self.only_on_wrong_signal_escalation || signal_driven)
@@ -66,107 +65,149 @@ impl HandoffNoteProcessor {
     }
 }
 
-#[async_trait]
-impl Processor for HandoffNoteProcessor {
-    async fn process(&self, state: &mut State, event: Event<'_>) -> Result<()> {
-        let Event::Decision(decision) = event else {
-            return Ok(());
-        };
-        let tier = decision.selected_model().to_string();
-        // Read (and release the borrow on) the source the picker stashed.
-        let source = match state.extra.get("decision_source") {
-            Some(StateValue::String(source)) => Some(source.clone()),
-            _ => None,
-        };
-        if let Some(note) = self.note_for(&tier, source.as_deref()) {
-            state
-                .extra
-                .insert(HANDOFF_NOTE_KEY.to_string(), StateValue::String(note));
-        }
-        Ok(())
+/// Splices `note` into the request the routed model is about to receive.
+///
+/// The note is appended to the trailing user message when there is one, rather
+/// than sent as its own turn: Anthropic rejects two consecutive user messages,
+/// and a `tool_result` must stay first within its message. Appending a text
+/// block after it satisfies both and keeps the addition a cache-safe suffix. Any
+/// other trailing role — an empty conversation, or one ending on an assistant
+/// turn — takes a fresh user message.
+pub(crate) fn inject_note(request: &mut Request, note: &str) {
+    match request.llm_request.messages.last_mut() {
+        Some(last) if last.role == Role::User => last.content.push(ContentBlock::Text {
+            text: note.to_string(),
+        }),
+        _ => request
+            .llm_request
+            .messages
+            .push(Message::text(Role::User, note)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Decision;
+    use switchyard_protocol::{text_request, LlmRequest, ToolResult};
 
-    struct FakeDecision(&'static str);
-    impl Decision for FakeDecision {
-        fn selected_model(&self) -> &str {
-            self.0
-        }
-        fn reasoning(&self) -> Option<&str> {
-            None
-        }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
+    const ESCALATION: &str = "recovering from an error";
+    const DEESCALATION: &str = "settled — carry on";
+
+    fn config(only_on_wrong_signal_escalation: bool) -> HandoffNoteConfig {
+        HandoffNoteConfig::new(
+            ESCALATION,
+            Some(DEESCALATION.to_string()),
+            only_on_wrong_signal_escalation,
+        )
     }
 
-    fn state_with_source(source: &str) -> State {
-        let mut state = State::default();
-        state.extra.insert(
-            "decision_source".to_string(),
-            StateValue::String(source.to_string()),
-        );
-        state
-    }
-
-    async fn run(processor: &HandoffNoteProcessor, state: &mut State, tier: &'static str) {
-        processor
-            .process(state, Event::Decision(&FakeDecision(tier)))
-            .await
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn escalation_note_recorded_on_signal_driven_strong() {
-        let processor = HandoffNoteProcessor::new("recovering from an error", None, true);
+    #[test]
+    fn escalation_note_applies_to_signal_driven_strong() {
         for source in ["override", "dimensions"] {
-            let mut state = state_with_source(source);
-            run(&processor, &mut state, "strong").await;
-            assert!(matches!(
-                state.extra.get(HANDOFF_NOTE_KEY),
-                Some(StateValue::String(note)) if note == "recovering from an error"
-            ));
+            assert_eq!(
+                config(true).note_for("strong", Some(source)),
+                Some(ESCALATION.to_string())
+            );
         }
     }
 
-    #[tokio::test]
-    async fn no_escalation_note_on_fall_open_default_when_gated() {
-        let processor = HandoffNoteProcessor::new("recovering from an error", None, true);
-        let mut state = state_with_source("fall_open");
-        run(&processor, &mut state, "strong").await;
-        assert!(!state.extra.contains_key(HANDOFF_NOTE_KEY));
+    #[test]
+    fn no_escalation_note_on_fall_open_default_when_gated() {
+        assert_eq!(config(true).note_for("strong", Some("fall_open")), None);
     }
 
-    #[tokio::test]
-    async fn escalation_note_on_fall_open_when_not_gated() {
-        let processor = HandoffNoteProcessor::new("recovering from an error", None, false);
-        let mut state = state_with_source("fall_open");
-        run(&processor, &mut state, "strong").await;
-        assert!(state.extra.contains_key(HANDOFF_NOTE_KEY));
+    #[test]
+    fn escalation_note_on_fall_open_when_not_gated() {
+        assert_eq!(
+            config(false).note_for("strong", Some("fall_open")),
+            Some(ESCALATION.to_string())
+        );
     }
 
-    #[tokio::test]
-    async fn deescalation_note_recorded_on_weak_when_configured() {
-        let processor =
-            HandoffNoteProcessor::new("esc", Some("settled — carry on".to_string()), true);
-        let mut state = state_with_source("tests_passed");
-        run(&processor, &mut state, "weak").await;
-        assert!(matches!(
-            state.extra.get(HANDOFF_NOTE_KEY),
-            Some(StateValue::String(note)) if note == "settled — carry on"
-        ));
+    #[test]
+    fn deescalation_note_applies_to_weak_when_configured() {
+        assert_eq!(
+            config(true).note_for("weak", Some("tests_passed")),
+            Some(DEESCALATION.to_string())
+        );
     }
 
-    #[tokio::test]
-    async fn no_deescalation_note_when_unconfigured() {
-        let processor = HandoffNoteProcessor::new("esc", None, true);
-        let mut state = state_with_source("tests_passed");
-        run(&processor, &mut state, "weak").await;
-        assert!(!state.extra.contains_key(HANDOFF_NOTE_KEY));
+    #[test]
+    fn no_deescalation_note_when_unconfigured() {
+        let config = HandoffNoteConfig::new(ESCALATION, None, true);
+        assert_eq!(config.note_for("weak", Some("tests_passed")), None);
+    }
+
+    fn request_with(messages: Vec<Message>) -> Request {
+        Request {
+            llm_request: LlmRequest {
+                messages,
+                ..LlmRequest::default()
+            },
+            raw_request: None,
+            metadata: None,
+        }
+    }
+
+    #[test]
+    fn note_appends_to_a_trailing_user_turn_after_its_tool_result() {
+        // The shape a coding-agent turn actually arrives in: the tool result
+        // leads the trailing user message, so the note has to follow it.
+        let tool_result = ContentBlock::ToolResult(ToolResult {
+            tool_call_id: "call_1".to_string(),
+            content: vec![ContentBlock::Text {
+                text: "exit 1".to_string(),
+            }],
+            is_error: Some(true),
+        });
+        let mut request = request_with(vec![Message {
+            role: Role::User,
+            content: vec![tool_result.clone()],
+        }]);
+
+        inject_note(&mut request, ESCALATION);
+
+        let messages = &request.llm_request.messages;
+        assert_eq!(messages.len(), 1, "no second consecutive user turn");
+        assert_eq!(
+            messages[0].content,
+            vec![
+                tool_result,
+                ContentBlock::Text {
+                    text: ESCALATION.to_string()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn note_becomes_a_new_user_turn_after_an_assistant_turn() {
+        let mut request = request_with(vec![Message::text(Role::Assistant, "done")]);
+
+        inject_note(&mut request, ESCALATION);
+
+        let messages = &request.llm_request.messages;
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, Role::User);
+        assert_eq!(messages[1].text_content(""), Some(ESCALATION.to_string()));
+    }
+
+    #[test]
+    fn note_leaves_the_rest_of_the_conversation_untouched() {
+        let mut request = Request {
+            llm_request: text_request(Some("auto".to_string()), "fix the build"),
+            raw_request: None,
+            metadata: None,
+        };
+
+        inject_note(&mut request, ESCALATION);
+
+        let trail: Vec<String> = request
+            .llm_request
+            .messages
+            .iter()
+            .filter_map(|message| message.text_content("|"))
+            .collect();
+        assert_eq!(trail, vec![format!("fix the build|{ESCALATION}")]);
     }
 }

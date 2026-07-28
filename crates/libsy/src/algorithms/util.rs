@@ -6,6 +6,7 @@ pub(crate) mod handoff_notes;
 mod llm_judge;
 pub(crate) mod stage_router;
 mod subagent;
+pub(crate) mod tier_prompts;
 pub(crate) mod tool_signals;
 
 pub use affinity::AffinityRouter;
