@@ -76,6 +76,10 @@
 //!
 //! [`algorithms::LlmTaskClassifier`] classifies with one model; compose it with
 //! [`algorithms::FallThrough`] to route to the selected target.
+//!
+//! [`algorithms::EscalationRouter`] calls an efficient model first and escalates to a
+//! capable model when a judge finds the response insufficient; it pins escalated sessions
+//! to the capable model for all subsequent turns.
 
 mod core;
 pub use core::*;
