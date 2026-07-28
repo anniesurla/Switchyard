@@ -5,13 +5,11 @@
 //!
 //! A strong and a weak model rarely want the same instructions: the capable tier
 //! is worth telling to slow down and diagnose, the efficient one to stay on the
-//! settled plan. [`TierPromptProcessor`] appends the prompt configured for the
-//! tier a turn routed to, so the instruction follows the model rather than the
-//! session.
+//! settled plan. [`TierPromptProcessor`] prepends the routed tier's prompt, so
+//! the instruction follows the model rather than the session.
 //!
-//! Unlike a handoff note, the prompt applies to *every* turn on that tier, not
-//! just the turn that switched to it, and it applies however the tier was
-//! chosen — signals, the LLM fallback, or falling open.
+//! Unlike a handoff note, it applies on every turn that tier serves, however the
+//! tier was chosen — signals, the judge, or falling open.
 
 use async_trait::async_trait;
 use switchyard_protocol::{ContentBlock, InstructionBlock, Role};
@@ -60,10 +58,10 @@ impl TierPromptProcessor {
 impl Processor for TierPromptProcessor {
     async fn process(&self, state: &mut State, event: Event<'_>) -> Result<()> {
         match event {
-            // The decision is replayed once the whole cascade has run, so this is
-            // the tier the turn really routed to — whichever classifier picked it.
+            // Replayed once the whole cascade has run, so this is the tier the
+            // turn really routed to — whichever classifier picked it. Recorded
+            // only when there is a prompt for the request hook to apply.
             Event::Decision(decision) => {
-                // Nothing to hand the request hook when this tier has no prompt.
                 let tier = decision.selected_model();
                 if self.prompts.prompt_for(tier).is_some() {
                     state.extra.insert(

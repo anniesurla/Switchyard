@@ -311,9 +311,8 @@ fn ratio(numerator: u32, denominator: u32) -> f64 {
 /// tiers from tool-result signals, via the configured picker mode and the
 /// confidence the scorer must reach before it acts on the signal alone.
 ///
-/// With [`with_handoff_notes`](Self::with_handoff_notes) it also hands the
-/// routed model a note explaining why the signals sent the turn its way,
-/// spliced into the outbound request.
+/// With [`with_handoff_notes`](Self::with_handoff_notes) it also splices a note
+/// into the request explaining why the signals sent the turn where they did.
 pub struct StageClassifier {
     mode: PickerMode,
     confidence_threshold: f64,
@@ -339,11 +338,7 @@ impl StageClassifier {
     }
 
     /// Splices the handoff note for a turn this classifier resolved to `tier`.
-    ///
-    /// Stateless — no per-session tier tracking. The note is a statement about
-    /// *this* turn's signals, so every turn those signals drive carries it, and
-    /// a turn they do not drive never does. It rides in the forwarded request
-    /// only, so notes cannot accumulate across turns.
+    /// Stateless — see the [`handoff_notes`](super::handoff_notes) module docs.
     fn apply_handoff_note(&self, request: &mut Request, tier: Tier, source: DecisionSource) {
         let Some(config) = &self.handoff_notes else {
             return;

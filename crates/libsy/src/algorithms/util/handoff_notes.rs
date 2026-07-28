@@ -3,23 +3,16 @@
 
 //! Stage-router handoff notes.
 //!
-//! When a turn escalates to the strong tier (or hands back to the weak tier),
-//! a short **deterministic** note can be handed to the model taking over so it
-//! knows *why* — without re-diagnosing (weak→strong) or re-architecting settled
-//! work (strong→weak). This is not a model call; the note text comes from config.
+//! A short deterministic note telling the model taking over why it was handed
+//! the turn, so it need not re-diagnose (weak→strong) or re-architect settled
+//! work (strong→weak). No model call — the text comes from config.
 //!
-//! [`HandoffNoteConfig`] owns the note text and the gate deciding which note (if
-//! any) a turn earns; [`inject_note`] splices it into the outbound
-//! request. Both are driven by
-//! [`StageClassifier`](super::stage_router::StageClassifier) — the one component
-//! that knows both the chosen tier and why the signals chose it.
+//! Stateless: the note describes the turn's own signals, so every turn those
+//! signals drive carries one. It is ephemeral, riding in the forwarded request
+//! and never written back into the caller's history, so notes cannot accumulate.
 //!
-//! Stateless, with no per-session tier tracking: the note is a statement about
-//! the turn's own signals, so every turn those signals drive carries one.
-//!
-//! The note is **ephemeral**: it rides in the single forwarded request and is
-//! never written back into the caller's history, so notes cannot accumulate
-//! across turns.
+//! Driven by [`StageClassifier`](super::stage_router::StageClassifier), the one
+//! component that knows both the chosen tier and why the signals chose it.
 
 use switchyard_protocol::{ContentBlock, Message, Request, Role};
 

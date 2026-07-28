@@ -7,16 +7,12 @@
 //! the tool-signal processor that reads each turn's tool results and the
 //! [`StageClassifier`] that scores them onto the strong/weak tiers.
 //!
-//! Signals do not decide every turn. When the scorer is not confident the
-//! classifier abstains, and the cascade falls through to whatever is configured
-//! behind it — the same [`LlmTaskClassifier`] the capability route runs, joined
-//! in unchanged, and finally the tier the turn fell open to. The judge is
-//! consulted per turn and its verdict is not pinned to the session: an
-//! under-threshold turn is a fresh question, so nothing carries a stale answer
-//! forward.
+//! Signals do not decide every turn. An under-threshold turn abstains and falls
+//! through to the optional [`LlmTaskClassifier`] — the capability route's judge,
+//! joined in unchanged — and then to the picker's default tier. The judge is
+//! asked per turn and its verdict is never pinned to the session.
 //!
-//! Callers that need a different composition can still build the `FallThrough`
-//! from these parts themselves.
+//! Callers needing a different composition can build the `FallThrough` directly.
 
 use std::sync::Arc;
 
@@ -81,12 +77,8 @@ pub struct StageRouter {
 }
 
 /// Terminal classifier resolving an under-threshold turn to the picker's default
-/// tier.
-///
-/// [`StageClassifier`] leaves such a turn *ambiguous* — its own score is not
-/// decisive enough to route on, so anything configured behind it gets to decide
-/// first. This closes the cascade so the router never abstains, with or without
-/// a judge.
+/// tier, so the router never abstains — with or without a judge behind the
+/// signals.
 struct FallOpen(Tier);
 
 #[async_trait]
