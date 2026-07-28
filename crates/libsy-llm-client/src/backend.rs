@@ -12,6 +12,9 @@ use crate::error::is_overflow_body;
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
+/// Default number of retries for server-configured upstream calls.
+pub const DEFAULT_MAX_RETRIES: u32 = 2;
+
 // Canonical OpenAI phrase plus NVIDIA/LiteLLM wrap variants. Adding a new
 // provider-wrap is a one-line entry here, not a fork of the parsing logic.
 const OPENAI_OVERFLOW_PHRASES: &[&str] = &[
@@ -39,6 +42,8 @@ pub struct HttpBackendConfig {
     pub api_key: Option<String>,
     /// Static headers added to every outbound call to this backend.
     pub extra_headers: BTreeMap<String, String>,
+    /// Additional attempts after the initial upstream request.
+    pub max_retries: u32,
 }
 
 impl fmt::Debug for HttpBackendConfig {
@@ -47,6 +52,7 @@ impl fmt::Debug for HttpBackendConfig {
             .field("base_url", &self.base_url)
             .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
             .field("extra_headers", &self.extra_headers)
+            .field("max_retries", &self.max_retries)
             .finish()
     }
 }
@@ -124,6 +130,11 @@ impl Backend {
         &self.config().extra_headers
     }
 
+    /// Additional attempts allowed after the initial request.
+    pub fn max_retries(&self) -> u32 {
+        self.config().max_retries
+    }
+
     /// Whether this backend speaks the Anthropic Messages wire format — the only
     /// one with a `count_tokens` endpoint.
     pub fn is_anthropic(&self) -> bool {
@@ -186,6 +197,7 @@ mod tests {
             base_url: base_url.to_string(),
             api_key: Some("secret".to_string()),
             extra_headers: BTreeMap::new(),
+            max_retries: 0,
         }
     }
 

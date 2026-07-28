@@ -12,6 +12,7 @@ schema_version = 1
 format = "openai_chat"
 base_url = "https://example.com/v1"
 api_key_env = "API_KEY"
+max_retries = 2
 
 [targets.model_a]
 id = "model/a"
@@ -60,6 +61,8 @@ Each target references an entry under `llm_clients`. All configured clients use
 `anthropic_messages`. Supported algorithms are `noop`, `random`, `passthrough`, and
 `llm_classifier`. An `api_key_env` value names an environment variable; the TOML
 never contains the secret itself. If omitted, the client sends no authentication.
+`max_retries` defaults to `2` and applies to transport failures, timeouts, HTTP 408/429, and 5xx
+responses.
 
 Random-route `weights` are relative, follow target order, and do not need to sum to one. Omit them
 for equal weighting. The optional `seed` reproduces the selection sequence for the same call order.
