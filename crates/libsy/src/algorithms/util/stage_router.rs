@@ -395,8 +395,8 @@ impl Classifier for StageClassifier {
                     StateValue::String(source.as_str().to_string()),
                 );
                 // Only a resolved turn routes on this classifier's target, so it
-                // is the only branch whose tier change is this router's to
-                // explain — an ambiguous turn is decided further down the cascade.
+                // is the only branch whose tier the signals actually chose — an
+                // ambiguous turn is decided further down the cascade.
                 self.apply_handoff_note(request, tier, source);
                 let conf = score.abs();
                 // TODO add the non-target to this score set?
