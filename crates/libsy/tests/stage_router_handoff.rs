@@ -205,16 +205,14 @@ fn turn_request(failed: bool) -> Request {
 }
 
 #[tokio::test]
-async fn a_tier_change_hands_the_note_to_the_model_taking_over() -> Result<()> {
+async fn a_signal_driven_escalation_hands_the_note_to_the_model() -> Result<()> {
     let client = Arc::new(RecordingClient::default());
     let router = router(client.clone(), config_with_notes())?;
-    // One session: both turns share the context, so the second sees the tier the
-    // first routed to.
     let ctx = Context::<SharedState>::default();
 
-    // Turn 1 — a clean tool result keeps the session on the weak tier.
+    // Turn 1 — a clean tool result is under threshold and falls open to weak.
     router.clone().run(ctx.clone(), turn_request(false)).await?;
-    // Turn 2 — a failing tool result escalates, which is a real handover.
+    // Turn 2 — a critical tool error escalates on the signals alone.
     router.run(ctx, turn_request(true)).await?;
 
     let calls = client.routed();
@@ -241,27 +239,27 @@ async fn a_tier_change_hands_the_note_to_the_model_taking_over() -> Result<()> {
 }
 
 #[tokio::test]
-async fn the_note_does_not_persist_into_the_next_turn() -> Result<()> {
+async fn the_note_fires_every_escalated_turn_without_accumulating() -> Result<()> {
     let client = Arc::new(RecordingClient::default());
     let router = router(client.clone(), config_with_notes())?;
     let ctx = Context::<SharedState>::default();
 
-    router.clone().run(ctx.clone(), turn_request(false)).await?;
-    router.clone().run(ctx.clone(), turn_request(true)).await?;
-    // A third turn on the same escalated tier: no change, and the note from the
-    // previous turn was ephemeral, so nothing carries over.
-    router.run(ctx, turn_request(true)).await?;
+    // Three escalating turns in one session. Each is signal-driven, so each
+    // carries the note — and exactly one, since the note is never written back
+    // into the caller's history.
+    for _ in 0..3 {
+        router.clone().run(ctx.clone(), turn_request(true)).await?;
+    }
 
-    let calls = client.routed();
-    assert_eq!(calls[2].target, "strong");
-    assert!(
-        !calls[2]
+    for call in client.routed() {
+        assert_eq!(call.target, "strong");
+        let notes = call
             .messages
             .iter()
-            .any(|text| text.contains(ESCALATION)),
-        "the note should not accumulate: {:?}",
-        calls[2].messages
-    );
+            .filter(|text| text.contains(ESCALATION))
+            .count();
+        assert_eq!(notes, 1, "one note per turn, never accumulating: {call:?}");
+    }
     Ok(())
 }
 
@@ -377,6 +375,11 @@ async fn each_tier_is_handed_its_own_system_prompt() -> Result<()> {
     assert_eq!(routed[0].instructions, vec![WEAK_PROMPT.to_string()]);
     assert_eq!(routed[1].target, "strong");
     assert_eq!(routed[1].instructions, vec![STRONG_PROMPT.to_string()]);
+    // The tier prompt leads whatever instructions the client sent.
+    assert_eq!(
+        routed[1].instructions.first().map(String::as_str),
+        Some(STRONG_PROMPT)
+    );
     Ok(())
 }
 

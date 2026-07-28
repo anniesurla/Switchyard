@@ -103,7 +103,9 @@ pub mod stage_router {
     pub use crate::algorithms::util::handoff_notes::HandoffNoteConfig;
     pub use crate::algorithms::util::stage_router::{
         dimensions_from_signal, pick_tier, score_signal, CodingAgentDimensions, DecisionSource,
-        PickOutcome, PickerMode, ScoreResult, StageClassifier, Tier, LAST_TIER_KEY,
+        PickOutcome, PickerMode, ScoreResult, StageClassifier, Tier,
     };
-    pub use crate::algorithms::util::tier_prompts::{TierPromptProcessor, TierPrompts};
+    pub use crate::algorithms::util::tier_prompts::{
+        TierPromptProcessor, TierPrompts, ROUTED_TIER_KEY,
+    };
 }

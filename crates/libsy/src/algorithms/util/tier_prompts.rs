@@ -16,8 +16,11 @@
 use async_trait::async_trait;
 use switchyard_protocol::{ContentBlock, InstructionBlock, Role};
 
-use super::stage_router::LAST_TIER_KEY;
 use crate::{Event, Processor, Result, State, StateValue};
+
+/// `State.extra` key under which the tier the current turn routed to is recorded
+/// when the decision is replayed, for the outbound request hook to read back.
+pub const ROUTED_TIER_KEY: &str = "routed_tier";
 
 /// The system prompt to hand each tier. A tier left unset is routed untouched.
 #[derive(Clone, Debug, Default)]
@@ -41,7 +44,7 @@ impl TierPrompts {
     }
 }
 
-/// Appends the routed tier's system prompt to the outbound request.
+/// Prepends the routed tier's system prompt to the outbound request.
 pub struct TierPromptProcessor {
     prompts: TierPrompts,
 }
@@ -56,26 +59,36 @@ impl TierPromptProcessor {
 #[async_trait]
 impl Processor for TierPromptProcessor {
     async fn process(&self, state: &mut State, event: Event<'_>) -> Result<()> {
-        let Event::ModelRequest(request) = event else {
-            return Ok(());
-        };
-        // The decision replay stamps the routed tier before the outbound request
-        // is offered, so this reads the tier of the turn being sent — whichever
-        // classifier in the cascade picked it.
-        let Some(StateValue::String(tier)) = state.extra.get(LAST_TIER_KEY) else {
-            return Ok(());
-        };
-        let Some(prompt) = self.prompts.prompt_for(tier) else {
-            return Ok(());
-        };
-        // Appended after the client's own instructions: the caller's prompt still
-        // leads, and the addition stays a suffix of the cached prefix.
-        request.llm_request.instructions.push(InstructionBlock {
-            role: Role::System,
-            content: vec![ContentBlock::Text {
-                text: prompt.to_string(),
-            }],
-        });
+        match event {
+            // The decision is replayed once the whole cascade has run, so this is
+            // the tier the turn really routed to — whichever classifier picked it.
+            Event::Decision(decision) => {
+                state.extra.insert(
+                    ROUTED_TIER_KEY.to_string(),
+                    StateValue::String(decision.selected_model().to_string()),
+                );
+            }
+            Event::ModelRequest(request) => {
+                let Some(StateValue::String(tier)) = state.extra.get(ROUTED_TIER_KEY) else {
+                    return Ok(());
+                };
+                let Some(prompt) = self.prompts.prompt_for(tier) else {
+                    return Ok(());
+                };
+                // Ahead of the client's own instructions, so the tier framing is
+                // what the model reads first.
+                request.llm_request.instructions.insert(
+                    0,
+                    InstructionBlock {
+                        role: Role::System,
+                        content: vec![ContentBlock::Text {
+                            text: prompt.to_string(),
+                        }],
+                    },
+                );
+            }
+            _ => {}
+        }
         Ok(())
     }
 }
@@ -99,7 +112,7 @@ mod tests {
     fn state_on(tier: &str) -> State {
         let mut state = State::default();
         state.extra.insert(
-            LAST_TIER_KEY.to_string(),
+            ROUTED_TIER_KEY.to_string(),
             StateValue::String(tier.to_string()),
         );
         state
@@ -156,7 +169,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_prompt_follows_the_client_instructions() -> Result<()> {
+    async fn the_prompt_leads_the_client_instructions() -> Result<()> {
         let processor = TierPromptProcessor::new(prompts());
         let mut state = state_on("strong");
         let mut request = Request::default();
@@ -174,26 +187,51 @@ mod tests {
         assert_eq!(
             instructions(&request),
             vec![
-                "you are a coding agent".to_string(),
-                STRONG_PROMPT.to_string()
+                STRONG_PROMPT.to_string(),
+                "you are a coding agent".to_string()
             ]
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn other_events_inject_nothing() -> Result<()> {
+    async fn the_inbound_request_is_left_alone() -> Result<()> {
         let processor = TierPromptProcessor::new(prompts());
         let mut state = state_on("strong");
         let mut request = Request::default();
 
-        // Only the post-decision hook knows the tier; the inbound one runs before
-        // the cascade has picked anything.
+        // The inbound hook runs before the cascade has picked anything.
         processor
             .process(&mut state, Event::Request(&mut request))
             .await?;
 
         assert!(instructions(&request).is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_decision_replay_records_the_routed_tier() -> Result<()> {
+        struct FakeDecision;
+        impl crate::Decision for FakeDecision {
+            fn selected_model(&self) -> &str {
+                "strong"
+            }
+            fn reasoning(&self) -> Option<&str> {
+                None
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        let processor = TierPromptProcessor::new(prompts());
+        let mut state = State::default();
+        processor
+            .process(&mut state, Event::Decision(&FakeDecision))
+            .await?;
+
+        let request = run(&processor, &mut state).await?;
+        assert_eq!(instructions(&request), vec![STRONG_PROMPT.to_string()]);
         Ok(())
     }
 }

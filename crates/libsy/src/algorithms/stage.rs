@@ -50,7 +50,8 @@ pub struct StageRouterConfig {
     /// Trailing tool results the signals are computed over. `None` uses
     /// [`DEFAULT_RECENT_WINDOW`].
     pub recent_window: Option<usize>,
-    /// Note handed to the model taking over when a turn changes tier.
+    /// Note handed to the model on a signal-driven escalation, and on a
+    /// hand-back to the weak tier when a de-escalation note is configured.
     pub handoff_notes: Option<HandoffNoteConfig>,
     /// System prompt handed to each tier, on every turn it serves.
     pub tier_prompts: Option<TierPrompts>,
@@ -137,9 +138,7 @@ impl StageRouter {
 
         let mut router = FallThrough::new(targets)
             .with_processor(Arc::new(signals))
-            // Dual-role: the classifier reads back the tier its processor role
-            // recorded, so both roles must be the same instance.
-            .with_component(Arc::new(classifier));
+            .with_classifier(Arc::new(classifier));
         if let Some(fallback) = config.llm_fallback {
             // The capability judge, as the capability route builds it: the weak
             // tier is the efficient target, the strong tier the capable one.
