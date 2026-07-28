@@ -345,11 +345,16 @@ async fn handle_llm_request(
         Err(error) => return algorithm_error(error),
     };
 
-    let mut response = match into_http_response(response, wire_format, Some(requested_model)) {
+    // Body and routing header read the same decision, so the model named in the
+    // response can never disagree with `x-model-router-selected-model`. An empty
+    // trace leaves the id the upstream reported.
+    let decision = trace.last();
+    let served_model = decision.map(|decision| decision.selected_model().to_string());
+    let mut response = match into_http_response(response, wire_format, served_model) {
         Ok(response) => response,
         Err(error) => return server_error(error.to_string()),
     };
-    if let Some(decision) = trace.last() {
+    if let Some(decision) = decision {
         attach_routing_headers(&mut response, decision.as_ref());
     }
     response
