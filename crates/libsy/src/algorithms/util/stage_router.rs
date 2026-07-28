@@ -53,6 +53,26 @@ pub enum Tier {
     Capable,
 }
 
+impl Tier {
+    /// Semantic name of the target this tier routes to — the name a classifier
+    /// scores onto and the router's target set must hold.
+    pub fn target_name(self) -> &'static str {
+        match self {
+            Self::Capable => "strong",
+            Self::Efficient => "weak",
+        }
+    }
+
+    /// The tier a target name denotes, or `None` for a name outside the pair.
+    pub fn from_target_name(name: &str) -> Option<Self> {
+        match name {
+            "strong" => Some(Self::Capable),
+            "weak" => Some(Self::Efficient),
+            _ => None,
+        }
+    }
+}
+
 /// Which tier to default to when the scorer is not confident.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PickerMode {
@@ -63,7 +83,8 @@ pub enum PickerMode {
 }
 
 impl PickerMode {
-    fn default_tier(self) -> Tier {
+    /// Tier a turn routes to when the scorer is not confident enough to pick.
+    pub fn default_tier(self) -> Tier {
         match self {
             Self::CapableFirst => Tier::Capable,
             Self::EfficientFirst => Tier::Efficient,
@@ -286,10 +307,6 @@ fn ratio(numerator: u32, denominator: u32) -> f64 {
     }
 }
 
-/// `State.extra` key under which an ambiguous turn records the tier it falls
-/// open to, for a terminal classifier to resolve.
-pub const DEFAULT_TARGET_KEY: &str = "default_target";
-
 /// Signal-only stage-router classifier: scores each turn onto the strong/weak
 /// tiers from tool-result signals, via the configured picker mode and the
 /// confidence the scorer must reach before it acts on the signal alone.
@@ -327,12 +344,12 @@ impl StageClassifier {
     /// *this* turn's signals, so every turn those signals drive carries it, and
     /// a turn they do not drive never does. It rides in the forwarded request
     /// only, so notes cannot accumulate across turns.
-    fn apply_handoff_note(&self, request: &mut Request, tier: &str, source: DecisionSource) {
+    fn apply_handoff_note(&self, request: &mut Request, tier: Tier, source: DecisionSource) {
         let Some(config) = &self.handoff_notes else {
             return;
         };
-        if let Some(note) = config.note_for(tier, Some(source.as_str())) {
-            inject_note(request, &note);
+        if let Some(note) = config.note_for(tier, source) {
+            inject_note(request, note);
         }
     }
 }
@@ -349,12 +366,9 @@ impl Classifier for StageClassifier {
         let Some(signal) = tool_signals else {
             // No tool activity yet — nothing to score, so fall open to the
             // picker's configured default tier (same as a below-threshold turn).
-            let target = match self.mode.default_tier() {
-                Tier::Capable => "strong",
-                Tier::Efficient => "weak",
-            };
+            let target = self.mode.default_tier().target_name();
             state.extra.insert(
-                DEFAULT_TARGET_KEY.to_string(),
+                "default_target".to_string(),
                 StateValue::String(target.to_string()),
             );
             state.extra.insert(
@@ -375,10 +389,7 @@ impl Classifier for StageClassifier {
                 score,
                 ..
             } => {
-                let target = match tier {
-                    Tier::Capable => "strong",
-                    Tier::Efficient => "weak",
-                };
+                let target = tier.target_name();
                 state.extra.insert(
                     "decision_source".to_string(),
                     StateValue::String(source.as_str().to_string()),
@@ -386,7 +397,7 @@ impl Classifier for StageClassifier {
                 // Only a resolved turn routes on this classifier's target, so it
                 // is the only branch whose tier change is this router's to
                 // explain — an ambiguous turn is decided further down the cascade.
-                self.apply_handoff_note(request, target, source);
+                self.apply_handoff_note(request, tier, source);
                 let conf = score.abs();
                 // TODO add the non-target to this score set?
                 Ok(Classification::Scores(vec![Score {
@@ -399,12 +410,9 @@ impl Classifier for StageClassifier {
                 default_tier,
                 ..
             } => {
-                let target = match default_tier {
-                    Tier::Capable => "strong",
-                    Tier::Efficient => "weak",
-                };
+                let target = default_tier.target_name();
                 state.extra.insert(
-                    DEFAULT_TARGET_KEY.to_string(),
+                    "default_target".to_string(),
                     StateValue::String(target.to_string()),
                 );
                 state.extra.insert(

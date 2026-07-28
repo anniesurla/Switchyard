@@ -375,11 +375,6 @@ async fn each_tier_is_handed_its_own_system_prompt() -> Result<()> {
     assert_eq!(routed[0].instructions, vec![WEAK_PROMPT.to_string()]);
     assert_eq!(routed[1].target, "strong");
     assert_eq!(routed[1].instructions, vec![STRONG_PROMPT.to_string()]);
-    // The tier prompt leads whatever instructions the client sent.
-    assert_eq!(
-        routed[1].instructions.first().map(String::as_str),
-        Some(STRONG_PROMPT)
-    );
     Ok(())
 }
 

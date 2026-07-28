@@ -23,13 +23,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use super::util::handoff_notes::HandoffNoteConfig;
-use super::util::stage_router::{PickerMode, StageClassifier, DEFAULT_TARGET_KEY};
+use super::util::stage_router::{PickerMode, StageClassifier, Tier};
 use super::util::tier_prompts::{TierPromptProcessor, TierPrompts};
 use super::util::tool_signals::ToolSignalProcessor;
 use super::{FallThrough, LlmTaskClassifier};
 use crate::{
     Algorithm, Classification, Classifier, Context, Driver, LibsyError, LlmTarget, LlmTargetSet,
-    Request, Response, Result, Score, SharedState, State, StateValue, DEFAULT_RECENT_WINDOW,
+    Request, Response, Result, RoutedLlmClient, Score, SharedState, State, DEFAULT_RECENT_WINDOW,
 };
 
 /// The judge consulted when the signals are not decisive.
@@ -80,29 +80,25 @@ pub struct StageRouter {
     inner: Arc<FallThrough>,
 }
 
-/// Terminal classifier resolving the tier an under-threshold turn falls open to.
+/// Terminal classifier resolving an under-threshold turn to the picker's default
+/// tier.
 ///
 /// [`StageClassifier`] leaves such a turn *ambiguous* — its own score is not
 /// decisive enough to route on, so anything configured behind it gets to decide
-/// first. This closes the cascade with the default tier that turn recorded, so
-/// the router never abstains, with or without a judge.
-struct FallOpen;
+/// first. This closes the cascade so the router never abstains, with or without
+/// a judge.
+struct FallOpen(Tier);
 
 #[async_trait]
 impl Classifier for FallOpen {
     async fn score(
         &self,
-        state: &mut State,
+        _state: &mut State,
         _request: &mut Request,
         _driver: Option<&Driver>,
     ) -> Result<Classification> {
-        let Some(StateValue::String(target)) = state.extra.get(DEFAULT_TARGET_KEY) else {
-            return Err(LibsyError::AlgorithmError {
-                message: "stage classifier left no default target to fall open to".to_string(),
-            });
-        };
         Ok(Classification::Scores(vec![Score {
-            target: target.clone(),
+            target: self.0.target_name().to_string(),
             confidence: 0.0,
         }]))
     }
@@ -125,8 +121,8 @@ impl StageRouter {
         }
         // The classifier scores onto these two names, so a missing tier would
         // only surface as a failed target lookup mid-turn.
-        let strong = targets.get_target("strong")?;
-        let weak = targets.get_target("weak")?;
+        let strong = targets.get_target(Tier::Capable.target_name())?;
+        let weak = targets.get_target(Tier::Efficient.target_name())?;
 
         let mut classifier = StageClassifier::new(config.mode, config.confidence_threshold);
         if let Some(notes) = config.handoff_notes {
@@ -149,7 +145,7 @@ impl StageRouter {
                 fallback.threshold,
             )?));
         }
-        router = router.with_classifier(Arc::new(FallOpen));
+        router = router.with_classifier(Arc::new(FallOpen(config.mode.default_tier())));
         if let Some(prompts) = config.tier_prompts {
             // Runs on the post-decision hook, so it applies to the tier the
             // cascade settled on, whichever classifier picked it.
@@ -166,6 +162,10 @@ impl StageRouter {
 impl Algorithm<SharedState> for StageRouter {
     fn name(&self) -> &str {
         "stage_router"
+    }
+
+    fn count_tokens_client(&self) -> Option<Arc<dyn RoutedLlmClient>> {
+        self.inner.count_tokens_client()
     }
 
     async fn create_run_task(

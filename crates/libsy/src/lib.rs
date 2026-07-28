@@ -105,7 +105,5 @@ pub mod stage_router {
         dimensions_from_signal, pick_tier, score_signal, CodingAgentDimensions, DecisionSource,
         PickOutcome, PickerMode, ScoreResult, StageClassifier, Tier,
     };
-    pub use crate::algorithms::util::tier_prompts::{
-        TierPromptProcessor, TierPrompts, ROUTED_TIER_KEY,
-    };
+    pub use crate::algorithms::util::tier_prompts::{TierPromptProcessor, TierPrompts};
 }

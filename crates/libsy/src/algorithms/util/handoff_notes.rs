@@ -23,6 +23,8 @@
 
 use switchyard_protocol::{ContentBlock, Message, Request, Role};
 
+use super::stage_router::{DecisionSource, Tier};
+
 /// The notes a stage router hands to the model taking over, and the gate that
 /// decides when the escalation note applies.
 pub struct HandoffNoteConfig {
@@ -50,19 +52,21 @@ impl HandoffNoteConfig {
 
     /// The note for a turn routed to `tier` with picker `source`, or `None` when
     /// no note applies.
-    pub(crate) fn note_for(&self, tier: &str, source: Option<&str>) -> Option<String> {
+    pub(crate) fn note_for(&self, tier: Tier, source: DecisionSource) -> Option<&str> {
         match tier {
-            // Escalation to the strong tier. When gated, only a signal-driven
+            // Escalation to the capable tier. When gated, only a signal-driven
             // escalation qualifies — never a `fall_open` default, which would
             // tell the strong model the weak one was stalling when it wasn't.
-            "strong" => {
-                let signal_driven = matches!(source, Some("override") | Some("dimensions"));
+            Tier::Capable => {
+                let signal_driven = matches!(
+                    source,
+                    DecisionSource::Override | DecisionSource::Dimensions
+                );
                 (!self.only_on_wrong_signal_escalation || signal_driven)
-                    .then(|| self.escalation_note.clone())
+                    .then_some(self.escalation_note.as_str())
             }
-            // Hand-back to the weak tier, when a de-escalation note is configured.
-            "weak" => self.deescalation_note.clone(),
-            _ => None,
+            // Hand-back to the efficient tier, when a de-escalation note is configured.
+            Tier::Efficient => self.deescalation_note.as_deref(),
         }
     }
 }
@@ -104,40 +108,46 @@ mod tests {
     }
 
     #[test]
-    fn escalation_note_applies_to_signal_driven_strong() {
-        for source in ["override", "dimensions"] {
+    fn escalation_note_applies_to_signal_driven_capable() {
+        for source in [DecisionSource::Override, DecisionSource::Dimensions] {
             assert_eq!(
-                config(true).note_for("strong", Some(source)),
-                Some(ESCALATION.to_string())
+                config(true).note_for(Tier::Capable, source),
+                Some(ESCALATION)
             );
         }
     }
 
     #[test]
     fn no_escalation_note_on_fall_open_default_when_gated() {
-        assert_eq!(config(true).note_for("strong", Some("fall_open")), None);
+        assert_eq!(
+            config(true).note_for(Tier::Capable, DecisionSource::FallOpen),
+            None
+        );
     }
 
     #[test]
     fn escalation_note_on_fall_open_when_not_gated() {
         assert_eq!(
-            config(false).note_for("strong", Some("fall_open")),
-            Some(ESCALATION.to_string())
+            config(false).note_for(Tier::Capable, DecisionSource::FallOpen),
+            Some(ESCALATION)
         );
     }
 
     #[test]
-    fn deescalation_note_applies_to_weak_when_configured() {
+    fn deescalation_note_applies_to_efficient_when_configured() {
         assert_eq!(
-            config(true).note_for("weak", Some("tests_passed")),
-            Some(DEESCALATION.to_string())
+            config(true).note_for(Tier::Efficient, DecisionSource::TestsPassed),
+            Some(DEESCALATION)
         );
     }
 
     #[test]
     fn no_deescalation_note_when_unconfigured() {
         let config = HandoffNoteConfig::new(ESCALATION, None, true);
-        assert_eq!(config.note_for("weak", Some("tests_passed")), None);
+        assert_eq!(
+            config.note_for(Tier::Efficient, DecisionSource::TestsPassed),
+            None
+        );
     }
 
     fn request_with(messages: Vec<Message>) -> Request {

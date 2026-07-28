@@ -16,11 +16,12 @@
 use async_trait::async_trait;
 use switchyard_protocol::{ContentBlock, InstructionBlock, Role};
 
+use super::stage_router::Tier;
 use crate::{Event, Processor, Result, State, StateValue};
 
-/// `State.extra` key under which the tier the current turn routed to is recorded
-/// when the decision is replayed, for the outbound request hook to read back.
-pub const ROUTED_TIER_KEY: &str = "routed_tier";
+/// `State.extra` key bridging this processor's two hooks: the decision replay
+/// records the routed tier, the outbound request hook reads it back.
+const ROUTED_TIER_KEY: &str = "routed_tier";
 
 /// The system prompt to hand each tier. A tier left unset is routed untouched.
 #[derive(Clone, Debug, Default)]
@@ -36,10 +37,9 @@ impl TierPrompts {
     }
 
     fn prompt_for(&self, tier: &str) -> Option<&str> {
-        match tier {
-            "strong" => self.strong.as_deref(),
-            "weak" => self.weak.as_deref(),
-            _ => None,
+        match Tier::from_target_name(tier)? {
+            Tier::Capable => self.strong.as_deref(),
+            Tier::Efficient => self.weak.as_deref(),
         }
     }
 }
@@ -63,10 +63,14 @@ impl Processor for TierPromptProcessor {
             // The decision is replayed once the whole cascade has run, so this is
             // the tier the turn really routed to — whichever classifier picked it.
             Event::Decision(decision) => {
-                state.extra.insert(
-                    ROUTED_TIER_KEY.to_string(),
-                    StateValue::String(decision.selected_model().to_string()),
-                );
+                // Nothing to hand the request hook when this tier has no prompt.
+                let tier = decision.selected_model();
+                if self.prompts.prompt_for(tier).is_some() {
+                    state.extra.insert(
+                        ROUTED_TIER_KEY.to_string(),
+                        StateValue::String(tier.to_string()),
+                    );
+                }
             }
             Event::ModelRequest(request) => {
                 let Some(StateValue::String(tier)) = state.extra.get(ROUTED_TIER_KEY) else {
