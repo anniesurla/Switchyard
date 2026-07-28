@@ -9,10 +9,9 @@
 
 use async_trait::async_trait;
 use serde::Deserialize;
-use serde_json::Value;
 use switchyard_protocol::{LlmRequest, Message, OutputParams, Role};
 
-use super::util::{Judge, JudgeClassifier, JudgeConfig, JudgePolicy};
+use super::util::{load_judge_config, Judge, JudgeClassifier, JudgeConfig, JudgePolicy};
 use crate::{
     Classification, Classifier, Driver, LibsyError, LlmTarget, Request, Result, Score, State,
 };
@@ -203,29 +202,8 @@ impl LlmTaskClassifier {
         })
     }
 
-    /// Loads the judge configuration from the packaged prompt and schema.
-    /// TODO: Move towards more generic loading and parsing of config when we multiple prompts and schemas to handle for same algorithm
     fn load_judge_config() -> Result<JudgeConfig> {
-        // The response schema is rendered into the prompt and sent as structured-output metadata.
-        // One asset therefore defines both the instruction contract and provider enforcement.
-        let response_schema: Value =
-            serde_json::from_str(SCHEMA_TEMPLATE).map_err(|error| LibsyError::AlgorithmError {
-                message: format!("capability response schema is invalid: {error}"),
-            })?;
-        let prompt_schema = response_schema
-            .pointer("/json_schema/schema")
-            .ok_or_else(|| LibsyError::AlgorithmError {
-                message: "capability response schema has no json_schema.schema".to_string(),
-            })?;
-        let prompt_schema = serde_json::to_string_pretty(prompt_schema).map_err(|error| {
-            LibsyError::AlgorithmError {
-                message: format!("capability prompt schema could not be rendered: {error}"),
-            }
-        })?;
-        Ok(JudgeConfig {
-            system_prompt: PROMPT_TEMPLATE.replace("{{RESPONSE_SCHEMA}}", &prompt_schema),
-            response_schema: Some(response_schema),
-        })
+        load_judge_config(PROMPT_TEMPLATE, SCHEMA_TEMPLATE)
     }
 }
 
@@ -259,6 +237,7 @@ mod tests {
 
     use parking_lot::Mutex;
 
+    use serde_json::Value;
     use super::*;
     use switchyard_protocol::{completion_text, text_response, LlmClientError};
 
